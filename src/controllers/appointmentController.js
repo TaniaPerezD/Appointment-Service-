@@ -1,7 +1,23 @@
 const { v4: uuidv4 } = require('uuid');
+const { Op } = require('sequelize');
 const { Appointment, VideoSession } = require('../models');
 
 const TERMINAL_STATUSES = ['cancelada', 'completada'];
+const SLOT_MS = 30 * 60 * 1000;
+
+const findConflict = async ({ patient_id, doctor_id, appointment_date, excludeId }) => {
+  const date = new Date(appointment_date);
+  const where = {
+    status: { [Op.notIn]: ['cancelada'] },
+    appointment_date: {
+      [Op.gte]: new Date(date.getTime() - SLOT_MS),
+      [Op.lt]: new Date(date.getTime() + SLOT_MS)
+    },
+    [Op.or]: [{ patient_id }, { doctor_id }]
+  };
+  if (excludeId) where.id = { [Op.ne]: excludeId };
+  return Appointment.findOne({ where });
+};
 
 const createAppointment = async (req, res) => {
   try {
@@ -16,6 +32,14 @@ const createAppointment = async (req, res) => {
     if (new Date(appointment_date) <= new Date()) {
       return res.status(400).json({
         error: 'La fecha de la cita debe ser futura'
+      });
+    }
+
+    const conflict = await findConflict({ patient_id, doctor_id, appointment_date });
+    if (conflict) {
+      const who = conflict.patient_id === patient_id ? 'paciente' : 'doctor';
+      return res.status(409).json({
+        error: `El ${who} ya tiene una cita en ese horario (slot de 30 min)`
       });
     }
 
@@ -82,6 +106,21 @@ const updateAppointment = async (req, res) => {
 
     if (appointment_date && new Date(appointment_date) <= new Date()) {
       return res.status(400).json({ error: 'La nueva fecha debe ser futura' });
+    }
+
+    if (appointment_date) {
+      const conflict = await findConflict({
+        patient_id: appointment.patient_id,
+        doctor_id: appointment.doctor_id,
+        appointment_date,
+        excludeId: id
+      });
+      if (conflict) {
+        const who = conflict.patient_id === appointment.patient_id ? 'paciente' : 'doctor';
+        return res.status(409).json({
+          error: `El ${who} ya tiene una cita en ese horario (slot de 30 min)`
+        });
+      }
     }
 
     const updates = {};
