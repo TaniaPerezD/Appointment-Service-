@@ -35,7 +35,6 @@ const VideoSession = sequelize.define('VideoSession', {
   }
 }, {
   tableName: 'video_sessions',
-  schema: 'appointment_service',
   timestamps: false
 });
 

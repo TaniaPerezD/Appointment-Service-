@@ -1,6 +1,19 @@
 const { v4: uuidv4 } = require('uuid');
 const { Op } = require('sequelize');
-const { Appointment, VideoSession } = require('../models');
+const { Appointment, VideoSession, User } = require('../models');
+
+const PATIENT_ATTRIBUTES = ['id', 'full_name', 'email', 'dni', 'phone'];
+
+const videoSessionWithPatient = (appointmentId) =>
+  VideoSession.findOne({
+    where: { appointment_id: appointmentId },
+    include: [{
+      model: Appointment,
+      as: 'appointment',
+      include: [{ model: User, as: 'patient', attributes: PATIENT_ATTRIBUTES }]
+    }]
+  });
+const { writeAudit } = require('../utils/audit');
 
 const TERMINAL_STATUSES = ['cancelada', 'completada'];
 const SLOT_MS = 30 * 60 * 1000;
@@ -50,23 +63,46 @@ const createAppointment = async (req, res) => {
       reason
     });
 
+    writeAudit({
+      user_id: patient_id,
+      action: 'CITA_CREADA',
+      description: `Cita agendada con doctor ${doctor_id} para ${appointment_date}`,
+      entity_type: 'appointment',
+      entity_id: appointment.id
+    });
+
     return res.status(201).json(appointment);
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
 };
 
+const parsePagination = (query) => {
+  const page = Math.max(1, parseInt(query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(query.limit) || 20));
+  return { limit, offset: (page - 1) * limit, page };
+};
+
 const getByPatient = async (req, res) => {
   try {
     const { patientId } = req.params;
+    const { limit, offset, page } = parsePagination(req.query);
 
-    const appointments = await Appointment.findAll({
+    const { count, rows } = await Appointment.findAndCountAll({
       where: { patient_id: patientId },
-      include: [{ model: VideoSession, as: 'videoSession', required: false }],
-      order: [['appointment_date', 'ASC']]
+      include: [
+        { model: VideoSession, as: 'videoSession', required: false },
+        { model: User, as: 'doctor', attributes: PATIENT_ATTRIBUTES }
+      ],
+      order: [['appointment_date', 'ASC']],
+      limit,
+      offset
     });
 
-    return res.json(appointments);
+    return res.json({
+      data: rows,
+      meta: { total: count, page, limit, pages: Math.ceil(count / limit) }
+    });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
@@ -75,14 +111,23 @@ const getByPatient = async (req, res) => {
 const getByDoctor = async (req, res) => {
   try {
     const { doctorId } = req.params;
+    const { limit, offset, page } = parsePagination(req.query);
 
-    const appointments = await Appointment.findAll({
+    const { count, rows } = await Appointment.findAndCountAll({
       where: { doctor_id: doctorId },
-      include: [{ model: VideoSession, as: 'videoSession', required: false }],
-      order: [['appointment_date', 'ASC']]
+      include: [
+        { model: VideoSession, as: 'videoSession', required: false },
+        { model: User, as: 'patient', attributes: PATIENT_ATTRIBUTES }
+      ],
+      order: [['appointment_date', 'ASC']],
+      limit,
+      offset
     });
 
-    return res.json(appointments);
+    return res.json({
+      data: rows,
+      meta: { total: count, page, limit, pages: Math.ceil(count / limit) }
+    });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
@@ -130,6 +175,14 @@ const updateAppointment = async (req, res) => {
     updates.status = status || 'modificada';
 
     await appointment.update(updates);
+
+    writeAudit({
+      action: 'CITA_MODIFICADA',
+      description: `Cita actualizada a estado '${updates.status}'`,
+      entity_type: 'appointment',
+      entity_id: id
+    });
+
     return res.json(appointment);
   } catch (error) {
     if (error.name === 'SequelizeValidationError') {
@@ -157,6 +210,14 @@ const cancelAppointment = async (req, res) => {
     }
 
     await appointment.update({ status: 'cancelada' });
+
+    writeAudit({
+      action: 'CITA_CANCELADA',
+      description: 'Cita cancelada',
+      entity_type: 'appointment',
+      entity_id: id
+    });
+
     return res.json({ message: 'Cita cancelada exitosamente', id });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -178,22 +239,80 @@ const createVideoSession = async (req, res) => {
       });
     }
 
-    // Return existing session if already created
-    const existing = await VideoSession.findOne({ where: { appointment_id: id } });
-    if (existing) {
-      return res.json(existing);
-    }
+    const existing = await videoSessionWithPatient(id);
+    if (existing) return res.json(existing);
 
     const sessionId = uuidv4();
-    const session = await VideoSession.create({
+    await VideoSession.create({
       appointment_id: id,
       session_url: `https://video.mediconnect.app/session/${sessionId}`,
-      // Simulated reference to encrypted S3 recording
       encrypted_recording_url: `s3://mediconnect-recordings/session-${sessionId}.enc`,
       status: 'pendiente'
     });
 
+    const session = await videoSessionWithPatient(id);
+
+    writeAudit({
+      action: 'VIDEO_SESSION_CREADA',
+      description: `Sesión de video generada para cita ${id}`,
+      entity_type: 'video_session',
+      entity_id: session.id
+    });
+
     return res.status(201).json(session);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+const VALID_TRANSITIONS = {
+  pendiente: 'iniciada',
+  iniciada: 'finalizada'
+};
+
+const updateVideoSession = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status) {
+      return res.status(400).json({ error: 'El campo status es requerido' });
+    }
+
+    const session = await VideoSession.findOne({ where: { appointment_id: id } });
+    if (!session) {
+      return res.status(404).json({ error: 'Sesión de video no encontrada para esta cita' });
+    }
+
+    const expectedNext = VALID_TRANSITIONS[session.status];
+    if (!expectedNext) {
+      return res.status(400).json({
+        error: `La sesión ya está en estado '${session.status}' y no puede avanzar`
+      });
+    }
+
+    if (status !== expectedNext) {
+      return res.status(400).json({
+        error: `Transición inválida: '${session.status}' → '${status}'. Se esperaba '${expectedNext}'`
+      });
+    }
+
+    const updates = { status };
+    if (status === 'iniciada') updates.started_at = new Date();
+    if (status === 'finalizada') updates.ended_at = new Date();
+
+    await session.update(updates);
+
+    const updated = await videoSessionWithPatient(id);
+
+    writeAudit({
+      action: 'VIDEO_SESSION_ACTUALIZADA',
+      description: `Sesión de video cambió a estado '${status}'`,
+      entity_type: 'video_session',
+      entity_id: session.id
+    });
+
+    return res.json(updated);
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
@@ -205,5 +324,6 @@ module.exports = {
   getByDoctor,
   updateAppointment,
   cancelAppointment,
-  createVideoSession
+  createVideoSession,
+  updateVideoSession
 };

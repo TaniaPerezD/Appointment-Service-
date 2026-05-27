@@ -36,7 +36,6 @@ const Appointment = sequelize.define('Appointment', {
   }
 }, {
   tableName: 'appointments',
-  schema: 'appointment_service',
   timestamps: false
 });
 
